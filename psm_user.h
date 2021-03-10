@@ -107,6 +107,8 @@ typedef void *psmi_hal_hw_context;
 #define PSMI_VERNO_GET_MAJOR(verno) (((verno)>>8) & 0xff)
 #define PSMI_VERNO_GET_MINOR(verno) (((verno)>>0) & 0xff)
 
+extern int psm2_gpid;
+
 int psmi_verno_client();
 int psmi_verno_isinteroperable(uint16_t verno);
 int MOCKABLE(psmi_isinitialized)();

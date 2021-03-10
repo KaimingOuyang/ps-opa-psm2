@@ -1412,77 +1412,85 @@ MOCK_DEF_EPILOGUE(ips_proto_flow_enqueue);
 psm2_error_t
 ips_proto_flow_flush_pio(struct ips_flow *flow, int *nflushed)
 {
-	struct ips_proto *proto = ((psm2_epaddr_t) (flow->ipsaddr))->proto;
-	struct ips_scb_pendlist *scb_pend = &flow->scb_pend;
-	int num_sent = 0;
-	uint64_t t_cyc;
 	ips_scb_t *scb;
 	psm2_error_t err = PSM2_OK;
+	int num_sent = 0;
+	int cur_pid = getpid();
 
-	psmi_assert(!SLIST_EMPTY(scb_pend));
+	if(cur_pid == psm2_gpid){
+		struct ips_proto *proto = ((psm2_epaddr_t)(flow->ipsaddr))->proto;
+		struct ips_scb_pendlist *scb_pend = &flow->scb_pend;
+		uint64_t t_cyc;
 
-	/* Out of credits - ACKs/NAKs reclaim recredit or congested flow */
-	if_pf((flow->credits <= 0) || (flow->flags & IPS_FLOW_FLAG_CONGESTED)) {
-		if (nflushed)
-			*nflushed = 0;
-		return PSM2_EP_NO_RESOURCES;
-	}
+		psmi_assert(!SLIST_EMPTY(scb_pend));
 
-	while (!SLIST_EMPTY(scb_pend) && flow->credits > 0) {
-		scb = SLIST_FIRST(scb_pend);
-		psmi_assert(scb->nfrag == 1);
-		/* When PSM_PERF is enabled, the following line causes the
+		/* Out of credits - ACKs/NAKs reclaim recredit or congested flow */
+		if_pf((flow->credits <= 0) || (flow->flags & IPS_FLOW_FLAG_CONGESTED))
+		{
+			if (nflushed)
+				*nflushed = 0;
+			return PSM2_EP_NO_RESOURCES;
+		}
+
+		while (!SLIST_EMPTY(scb_pend) && flow->credits > 0)
+		{
+			scb = SLIST_FIRST(scb_pend);
+			psmi_assert(scb->nfrag == 1);
+			/* When PSM_PERF is enabled, the following line causes the
 		   PMU to start a stop watch to measure instruction cycles of the
 		   TX speedpath of PSM.  The stop watch is stopped below. */
-		GENERIC_PERF_BEGIN(PSM_TX_SPEEDPATH_CTR);
-		if ((err = psmi_hal_spio_transfer_frame(proto, flow, &scb->pbc,
-							ips_scb_buffer(scb),
-							scb->payload_size,
-							PSMI_FALSE,
-							scb->ips_lrh.flags &
-							IPS_SEND_FLAG_PKTCKSUM,
-							scb->cksum[0],
-							proto->ep->context.psm_hw_ctxt
+			GENERIC_PERF_BEGIN(PSM_TX_SPEEDPATH_CTR);
+			if ((err = psmi_hal_spio_transfer_frame(proto, flow, &scb->pbc,
+													ips_scb_buffer(scb),
+													scb->payload_size,
+													PSMI_FALSE,
+													scb->ips_lrh.flags &
+														IPS_SEND_FLAG_PKTCKSUM,
+													scb->cksum[0],
+													proto->ep->context.psm_hw_ctxt
 #ifdef PSM_CUDA
-						   , IS_TRANSFER_BUF_GPU_MEM(scb)
+													,
+													IS_TRANSFER_BUF_GPU_MEM(scb)
 #endif
-			     ))
-		    == PSM2_OK) {
-			/* When PSM_PERF is enabled, the following line causes the
+														)) == PSM2_OK)
+			{
+				/* When PSM_PERF is enabled, the following line causes the
 			   PMU to stop a stop watch to measure instruction cycles of the
 			   TX speedpath of PSM.  The stop watch was started above. */
-			GENERIC_PERF_END(PSM_TX_SPEEDPATH_CTR);
-			t_cyc = get_cycles();
-			scb->scb_flags &= ~IPS_SEND_FLAG_PENDING;
-			scb->ack_timeout = proto->epinfo.ep_timeout_ack;
-			scb->abs_timeout = proto->epinfo.ep_timeout_ack + t_cyc;
-			psmi_timer_request(proto->timerq, flow->timer_ack,
-					   scb->abs_timeout);
-			num_sent++;
-			flow->credits--;
-			SLIST_REMOVE_HEAD(scb_pend, next);
+				GENERIC_PERF_END(PSM_TX_SPEEDPATH_CTR);
+				t_cyc = get_cycles();
+				scb->scb_flags &= ~IPS_SEND_FLAG_PENDING;
+				scb->ack_timeout = proto->epinfo.ep_timeout_ack;
+				scb->abs_timeout = proto->epinfo.ep_timeout_ack + t_cyc;
+				psmi_timer_request(proto->timerq, flow->timer_ack,
+								   scb->abs_timeout);
+				num_sent++;
+				flow->credits--;
+				SLIST_REMOVE_HEAD(scb_pend, next);
 #ifdef PSM_DEBUG
-			flow->scb_num_pending--;
+				flow->scb_num_pending--;
 #endif
-			PSM2_LOG_PKT_STRM(PSM2_LOG_TX,&scb->ips_lrh,"PKT_STRM: err: %d", err);
-
-		} else
-		{
-			/* When PSM_PERF is enabled, the following line causes the
+				PSM2_LOG_PKT_STRM(PSM2_LOG_TX, &scb->ips_lrh, "PKT_STRM: err: %d", err);
+			}
+			else
+			{
+				/* When PSM_PERF is enabled, the following line causes the
 			   PMU to stop a stop watch to measure instruction cycles of the
 			   TX speedpath of PSM.  The stop watch was started above. */
-			GENERIC_PERF_END(PSM_TX_SPEEDPATH_CTR);
-			break;
+				GENERIC_PERF_END(PSM_TX_SPEEDPATH_CTR);
+				break;
+			}
+		}
+
+		/* If out of flow credits re-schedule send timer */
+		if (!SLIST_EMPTY(scb_pend))
+		{
+			proto->stats.pio_busy_cnt++;
+			psmi_timer_request(proto->timerq, flow->timer_send,
+							   get_cycles() + proto->timeout_send);
 		}
 	}
-
-	/* If out of flow credits re-schedule send timer */
-	if (!SLIST_EMPTY(scb_pend)) {
-		proto->stats.pio_busy_cnt++;
-		psmi_timer_request(proto->timerq, flow->timer_send,
-				   get_cycles() + proto->timeout_send);
-	}
-
+	
 	if (nflushed != NULL)
 		*nflushed = num_sent;
 
@@ -1514,128 +1522,144 @@ static psm2_error_t scb_dma_send(struct ips_proto *proto, struct ips_flow *flow,
 psm2_error_t
 ips_proto_flow_flush_dma(struct ips_flow *flow, int *nflushed)
 {
-	struct ips_proto *proto = ((psm2_epaddr_t) (flow->ipsaddr))->proto;
-	struct ips_scb_pendlist *scb_pend = &flow->scb_pend;
+	
 	ips_scb_t *scb = NULL;
 	psm2_error_t err = PSM2_OK;
 	int nsent = 0;
+	int cur_pid = getpid();
 
-	psmi_assert(!SLIST_EMPTY(scb_pend));
+	if(cur_pid == psm2_gpid){
+		struct ips_proto *proto = ((psm2_epaddr_t)(flow->ipsaddr))->proto;
+		struct ips_scb_pendlist *scb_pend = &flow->scb_pend;
 
-	/* Out of credits - ACKs/NAKs reclaim recredit or congested flow */
-	if_pf((flow->credits <= 0) || (flow->flags & IPS_FLOW_FLAG_CONGESTED)) {
-		if (nflushed)
-			*nflushed = 0;
-		return PSM2_EP_NO_RESOURCES;
-	}
+		psmi_assert(!SLIST_EMPTY(scb_pend));
 
-	err = scb_dma_send(proto, flow, scb_pend, &nsent);
-	if (err != PSM2_OK && err != PSM2_EP_NO_RESOURCES &&
-	    err != PSM2_OK_NO_PROGRESS)
-		goto fail;
+		/* Out of credits - ACKs/NAKs reclaim recredit or congested flow */
+		if_pf((flow->credits <= 0) || (flow->flags & IPS_FLOW_FLAG_CONGESTED))
+		{
+			if (nflushed)
+				*nflushed = 0;
+			return PSM2_EP_NO_RESOURCES;
+		}
 
-	if (nsent > 0) {
-		uint64_t t_cyc = get_cycles();
-		int i = 0;
-		/*
+		err = scb_dma_send(proto, flow, scb_pend, &nsent);
+		if (err != PSM2_OK && err != PSM2_EP_NO_RESOURCES &&
+			err != PSM2_OK_NO_PROGRESS)
+			goto fail;
+
+		if (nsent > 0)
+		{
+			uint64_t t_cyc = get_cycles();
+			int i = 0;
+			/*
 		 * inflight counter proto->iovec_cntr_next_inflight should not drift
 		 * from completion counter proto->iovec_cntr_last_completed away too
 		 * far because we only have very small scb counter compared with
 		 * uint32_t counter value.
 		 */
 #ifdef PSM_DEBUG
-		flow->scb_num_pending -= nsent;
+			flow->scb_num_pending -= nsent;
 #endif
-		SLIST_FOREACH(scb, scb_pend, next) {
-			if (++i > nsent)
-				break;
+			SLIST_FOREACH(scb, scb_pend, next)
+			{
+				if (++i > nsent)
+					break;
 
-			PSM2_LOG_PKT_STRM(PSM2_LOG_TX,&scb->ips_lrh,"PKT_STRM: (dma)");
+				PSM2_LOG_PKT_STRM(PSM2_LOG_TX, &scb->ips_lrh, "PKT_STRM: (dma)");
 
-			scb->scb_flags &= ~IPS_SEND_FLAG_PENDING;
-			scb->ack_timeout =
-			    scb->nfrag * proto->epinfo.ep_timeout_ack;
-			scb->abs_timeout =
-			    scb->nfrag * proto->epinfo.ep_timeout_ack + t_cyc;
+				scb->scb_flags &= ~IPS_SEND_FLAG_PENDING;
+				scb->ack_timeout =
+					scb->nfrag * proto->epinfo.ep_timeout_ack;
+				scb->abs_timeout =
+					scb->nfrag * proto->epinfo.ep_timeout_ack + t_cyc;
 
-			psmi_assert(proto->sdma_scb_queue
-					[proto->sdma_fill_index] == NULL);
-			proto->sdma_scb_queue[proto->sdma_fill_index] = scb;
-			scb->dma_complete = 0;
+				psmi_assert(proto->sdma_scb_queue
+								[proto->sdma_fill_index] == NULL);
+				proto->sdma_scb_queue[proto->sdma_fill_index] = scb;
+				scb->dma_complete = 0;
 
-			proto->sdma_avail_counter--;
-			proto->sdma_fill_index++;
-			if (proto->sdma_fill_index == proto->sdma_queue_size)
-				proto->sdma_fill_index = 0;
+				proto->sdma_avail_counter--;
+				proto->sdma_fill_index++;
+				if (proto->sdma_fill_index == proto->sdma_queue_size)
+					proto->sdma_fill_index = 0;
 
-			/* Flow credits can temporarily go to negative for
+				/* Flow credits can temporarily go to negative for
 			 * packets tracking purpose, because we have sdma
 			 * chunk processing which can't send exact number
 			 * of packets as the number of credits.
 			 */
-			flow->credits -= scb->nfrag;
+				flow->credits -= scb->nfrag;
+			}
+			SLIST_FIRST(scb_pend) = scb;
 		}
-		SLIST_FIRST(scb_pend) = scb;
-	}
 
-	if (SLIST_FIRST(scb_pend) != NULL) {
-		psmi_assert(flow->scb_num_pending > 0);
+		if (SLIST_FIRST(scb_pend) != NULL)
+		{
+			psmi_assert(flow->scb_num_pending > 0);
 
-		switch (flow->protocol) {
-		case PSM_PROTOCOL_TIDFLOW:
-			/* For Tidflow we can cancel the ack timer if we have flow credits
+			switch (flow->protocol)
+			{
+			case PSM_PROTOCOL_TIDFLOW:
+				/* For Tidflow we can cancel the ack timer if we have flow credits
 			 * available and schedule the send timer. If we are out of flow
 			 * credits then the ack timer is scheduled as we are waiting for
 			 * an ACK to reclaim credits. This is required since multiple
 			 * tidflows may be active concurrently.
 			 */
-			if (flow->credits > 0) {
-				/* Cancel ack timer and reschedule send timer. Increment
+				if (flow->credits > 0)
+				{
+					/* Cancel ack timer and reschedule send timer. Increment
 				 * writev_busy_cnt as this really is DMA buffer exhaustion.
 				 */
-				psmi_timer_cancel(proto->timerq,
-						  flow->timer_ack);
-				psmi_timer_request(proto->timerq,
-						   flow->timer_send,
-						   get_cycles() +
-						   (proto->timeout_send << 1));
-				proto->stats.writev_busy_cnt++;
-			} else {
-				/* Re-instate ACK timer to reap flow credits */
-				psmi_timer_request(proto->timerq,
-						   flow->timer_ack,
-						   get_cycles() +
-						   (proto->epinfo.
-						    ep_timeout_ack >> 2));
-			}
+					psmi_timer_cancel(proto->timerq,
+									  flow->timer_ack);
+					psmi_timer_request(proto->timerq,
+									   flow->timer_send,
+									   get_cycles() +
+										   (proto->timeout_send << 1));
+					proto->stats.writev_busy_cnt++;
+				}
+				else
+				{
+					/* Re-instate ACK timer to reap flow credits */
+					psmi_timer_request(proto->timerq,
+									   flow->timer_ack,
+									   get_cycles() +
+										   (proto->epinfo.ep_timeout_ack >> 2));
+				}
 
-			break;
-		case PSM_PROTOCOL_GO_BACK_N:
-		default:
-			if (flow->credits > 0) {
-				/* Schedule send timer and increment writev_busy_cnt */
-				psmi_timer_request(proto->timerq,
-						   flow->timer_send,
-						   get_cycles() +
-						   (proto->timeout_send << 1));
-				proto->stats.writev_busy_cnt++;
-			} else {
-				/* Schedule ACK timer to reap flow credits */
-				psmi_timer_request(proto->timerq,
-						   flow->timer_ack,
-						   get_cycles() +
-						   (proto->epinfo.
-						    ep_timeout_ack >> 2));
+				break;
+			case PSM_PROTOCOL_GO_BACK_N:
+			default:
+				if (flow->credits > 0)
+				{
+					/* Schedule send timer and increment writev_busy_cnt */
+					psmi_timer_request(proto->timerq,
+									   flow->timer_send,
+									   get_cycles() +
+										   (proto->timeout_send << 1));
+					proto->stats.writev_busy_cnt++;
+				}
+				else
+				{
+					/* Schedule ACK timer to reap flow credits */
+					psmi_timer_request(proto->timerq,
+									   flow->timer_ack,
+									   get_cycles() +
+										   (proto->epinfo.ep_timeout_ack >> 2));
+				}
+				break;
 			}
-			break;
 		}
-	} else {
-		/* Schedule ack timer */
-		psmi_timer_cancel(proto->timerq, flow->timer_send);
-		psmi_timer_request(proto->timerq, flow->timer_ack,
-				   get_cycles() + proto->epinfo.ep_timeout_ack);
+		else
+		{
+			/* Schedule ack timer */
+			psmi_timer_cancel(proto->timerq, flow->timer_send);
+			psmi_timer_request(proto->timerq, flow->timer_ack,
+							   get_cycles() + proto->epinfo.ep_timeout_ack);
+		}
 	}
-
+	
 	/* We overwrite error with its new meaning for flushing packets */
 	if (nsent > 0)
 		if (scb)

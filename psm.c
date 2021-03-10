@@ -380,10 +380,16 @@ fail:
 }
 #endif
 
+int psm2_gpid;
+
 psm2_error_t __psm2_init(int *major, int *minor)
 {
 	psm2_error_t err = PSM2_OK;
 	union psmi_envvar_val env_tmask;
+	
+	/* Progress stealing patch:
+	 * record local process pid to avoid progress from stealing workers */
+	psm2_gpid = getpid();
 
 	psmi_log_initialize();
 
@@ -1086,32 +1092,40 @@ psm2_error_t __psm2_poll(psm2_ep_t ep)
 
 	PSMI_ASSERT_INITIALIZED();
 
-	PSMI_LOCK(ep->mq->progress_lock);
+	int cur_pid = getpid();
 
-	tmp = ep;
-	do {
-		err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0);	/* poll reqs & reps */
-		if (err1 > PSM2_OK_NO_PROGRESS) {	/* some error unrelated to polling */
-			PSMI_UNLOCK(ep->mq->progress_lock);
-			PSM2_LOG_MSG("leaving");
-			return err1;
-		}
+	if(cur_pid == psm2_gpid){
+		PSMI_LOCK(ep->mq->progress_lock);
 
-		err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0);	/* get into ips_do_work */
-		if (err2 > PSM2_OK_NO_PROGRESS) {	/* some error unrelated to polling */
-			PSMI_UNLOCK(ep->mq->progress_lock);
-			PSM2_LOG_MSG("leaving");
-			return err2;
-		}
-		ep = ep->mctxt_next;
-	} while (ep != tmp);
+		tmp = ep;
+		do
+		{
+			err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0); /* poll reqs & reps */
+			if (err1 > PSM2_OK_NO_PROGRESS)
+			{ /* some error unrelated to polling */
+				PSMI_UNLOCK(ep->mq->progress_lock);
+				PSM2_LOG_MSG("leaving");
+				return err1;
+			}
 
-	/* This is valid because..
-	 * PSM2_OK & PSM2_OK_NO_PROGRESS => PSM2_OK
-	 * PSM2_OK & PSM2_OK => PSM2_OK
-	 * PSM2_OK_NO_PROGRESS & PSM2_OK => PSM2_OK
-	 * PSM2_OK_NO_PROGRESS & PSM2_OK_NO_PROGRESS => PSM2_OK_NO_PROGRESS */
-	PSMI_UNLOCK(ep->mq->progress_lock);
+			err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0); /* get into ips_do_work */
+			if (err2 > PSM2_OK_NO_PROGRESS)
+			{ /* some error unrelated to polling */
+				PSMI_UNLOCK(ep->mq->progress_lock);
+				PSM2_LOG_MSG("leaving");
+				return err2;
+			}
+			ep = ep->mctxt_next;
+		} while (ep != tmp);
+
+		/* This is valid because..
+		* PSM2_OK & PSM2_OK_NO_PROGRESS => PSM2_OK
+		* PSM2_OK & PSM2_OK => PSM2_OK
+		* PSM2_OK_NO_PROGRESS & PSM2_OK => PSM2_OK
+		* PSM2_OK_NO_PROGRESS & PSM2_OK_NO_PROGRESS => PSM2_OK_NO_PROGRESS */
+		PSMI_UNLOCK(ep->mq->progress_lock);
+	}
+
 	PSM2_LOG_MSG("leaving");
 	return (err1 & err2);
 }
@@ -1120,30 +1134,35 @@ PSMI_API_DECL(psm2_poll)
 psm2_error_t __psmi_poll_internal(psm2_ep_t ep, int poll_amsh)
 {
 	psm2_error_t err1 = PSM2_OK_NO_PROGRESS;
-	psm2_error_t err2;
+	psm2_error_t err2 = PSM2_OK_NO_PROGRESS;
 	psm2_ep_t tmp;
 
 	PSM2_LOG_MSG("entering");
 	PSMI_LOCK_ASSERT(ep->mq->progress_lock);
 
-	tmp = ep;
-	do {
-		if (poll_amsh) {
-			err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0);	/* poll reqs & reps */
-			if (err1 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
-				PSM2_LOG_MSG("leaving");
-				return err1;
+	int cur_pid = getpid();
+
+	if(cur_pid == psm2_gpid){
+		tmp = ep;
+		do {
+			if (poll_amsh) {
+				err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0);	/* poll reqs & reps */
+				if (err1 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
+					PSM2_LOG_MSG("leaving");
+					return err1;
+				}
 			}
-		}
 
-		err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0);	/* get into ips_do_work */
-		if (err2 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
-			PSM2_LOG_MSG("leaving");
-			return err2;
-		}
+			err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0);	/* get into ips_do_work */
+			if (err2 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
+				PSM2_LOG_MSG("leaving");
+				return err2;
+			}
 
-		ep = ep->mctxt_next;
-	} while (ep != tmp);
+			ep = ep->mctxt_next;
+		} while (ep != tmp);
+	}
+	
 	PSM2_LOG_MSG("leaving");
 	return (err1 & err2);
 }

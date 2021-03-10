@@ -369,287 +369,299 @@ process_pending_acks(struct ips_recvhdrq *recvq))
  */
 psm2_error_t ips_recvhdrq_progress(struct ips_recvhdrq *recvq)
 {
-	/* When PSM_PERF is enabled, the following line causes the
-	   PMU to start a stop watch to measure instruction cycles of the
-	   RX speedpath of PSM.  The stop watch is stopped below. */
-	GENERIC_PERF_BEGIN(PSM_RX_SPEEDPATH_CTR);
-	struct ips_recvhdrq_state *state = recvq->state;
-	PSMI_CACHEALIGN struct ips_recvhdrq_event rcv_ev = {.proto =
-		    recvq->proto,
-		.recvq = recvq
-	};
-	struct ips_epstate_entry *epstaddr;
 	uint32_t num_hdrq_done = 0;
-	const uint32_t num_hdrq_todo = psmi_hal_get_rx_hdr_q_cnt(recvq->context->psm_hw_ctxt);
-	uint32_t dest_subcontext;
-	const uint32_t hdrq_elemsz = psmi_hal_get_rx_hdr_q_ent_size(recvq->context->psm_hw_ctxt) >> BYTE2DWORD_SHIFT;
-	int ret = IPS_RECVHDRQ_CONTINUE;
-	int done = 0, empty = 0;
-	int do_hdr_update = 0;
-	const psmi_hal_cl_q psm_hal_hdr_q = recvq->psm_hal_cl_hdrq;
-	const psmi_hal_cl_q psm_hal_egr_q = psm_hal_hdr_q + 1;
 
-	/* Returns whether the currently set 'rcv_hdr'/head is a readable entry */
-#define next_hdrq_is_ready()  (! empty )
+	int cur_pid = getpid();
+	if (cur_pid == psm2_gpid)
+	{
+		/* When PSM_PERF is enabled, the following line causes the
+		PMU to start a stop watch to measure instruction cycles of the
+		RX speedpath of PSM.  The stop watch is stopped below. */
+		GENERIC_PERF_BEGIN(PSM_RX_SPEEDPATH_CTR);
+		struct ips_recvhdrq_state *state = recvq->state;
+		PSMI_CACHEALIGN struct ips_recvhdrq_event rcv_ev = {.proto =
+																recvq->proto,
+															.recvq = recvq};
+		struct ips_epstate_entry *epstaddr;
 
-	if (psmi_hal_cl_q_empty(state->hdrq_head, psm_hal_hdr_q, recvq->context->psm_hw_ctxt))
-	    return PSM2_OK;
+		const uint32_t num_hdrq_todo = psmi_hal_get_rx_hdr_q_cnt(recvq->context->psm_hw_ctxt);
+		uint32_t dest_subcontext;
+		const uint32_t hdrq_elemsz = psmi_hal_get_rx_hdr_q_ent_size(recvq->context->psm_hw_ctxt) >> BYTE2DWORD_SHIFT;
+		int ret = IPS_RECVHDRQ_CONTINUE;
+		int done = 0, empty = 0;
+		int do_hdr_update = 0;
+		const psmi_hal_cl_q psm_hal_hdr_q = recvq->psm_hal_cl_hdrq;
+		const psmi_hal_cl_q psm_hal_egr_q = psm_hal_hdr_q + 1;
 
-	PSM2_LOG_MSG("entering");
+		/* Returns whether the currently set 'rcv_hdr'/head is a readable entry */
+#define next_hdrq_is_ready() (!empty)
 
-	done = !next_hdrq_is_ready();
+		if (psmi_hal_cl_q_empty(state->hdrq_head, psm_hal_hdr_q, recvq->context->psm_hw_ctxt))
+			return PSM2_OK;
 
-	rcv_ev.psm_hal_hdr_q = psm_hal_hdr_q;
+		PSM2_LOG_MSG("entering");
 
-	while (!done) {
-		psmi_hal_get_receive_event(state->hdrq_head, recvq->context->psm_hw_ctxt,
-					   &rcv_ev);
-		rcv_ev.has_cksum =
-		    ((recvq->proto->flags & IPS_PROTO_FLAG_CKSUM) &&
-		     (rcv_ev.p_hdr->flags & IPS_SEND_FLAG_PKTCKSUM));
-		_HFI_VDBG
-		    ("new packet: rcv_hdr %p, rhf %" PRIx64 "\n",
-		     rcv_ev.p_hdr, rcv_ev.psm_hal_rhf.raw_rhf);
+		done = !next_hdrq_is_ready();
+
+		rcv_ev.psm_hal_hdr_q = psm_hal_hdr_q;
+
+		while (!done)
+		{
+			psmi_hal_get_receive_event(state->hdrq_head, recvq->context->psm_hw_ctxt,
+									   &rcv_ev);
+			rcv_ev.has_cksum =
+				((recvq->proto->flags & IPS_PROTO_FLAG_CKSUM) &&
+				 (rcv_ev.p_hdr->flags & IPS_SEND_FLAG_PKTCKSUM));
+			_HFI_VDBG("new packet: rcv_hdr %p, rhf %" PRIx64 "\n",
+					  rcv_ev.p_hdr, rcv_ev.psm_hal_rhf.raw_rhf);
 
 #ifdef PSM_DEBUG
-		if_pf(_check_headers(&rcv_ev, psm_hal_hdr_q))
-			goto skip_packet;
+			if_pf(_check_headers(&rcv_ev, psm_hal_hdr_q)) goto skip_packet;
 #endif
-		dest_subcontext = _get_proto_subcontext(rcv_ev.p_hdr);
+			dest_subcontext = _get_proto_subcontext(rcv_ev.p_hdr);
 
-		/* If the destination is not our subcontext, process
-		 * message as subcontext message (shared contexts) */
-		if (dest_subcontext != recvq->subcontext) {
-			rcv_ev.ipsaddr = NULL;
-
-			ret = recvq->recvq_callbacks.callback_subcontext
-						(&rcv_ev, dest_subcontext);
-			if (ret == IPS_RECVHDRQ_REVISIT)
+			/* If the destination is not our subcontext, process
+			* message as subcontext message (shared contexts) */
+			if (dest_subcontext != recvq->subcontext)
 			{
-				PSM2_LOG_MSG("leaving");
-				/* When PSM_PERF is enabled, the following line causes the
-				   PMU to stop a stop watch to measure instruction cycles of
-				   the RX speedpath of PSM.  The stop watch was started
-				   above. */
-				GENERIC_PERF_END(PSM_RX_SPEEDPATH_CTR);
-				return PSM2_OK_NO_PROGRESS;
+				rcv_ev.ipsaddr = NULL;
+
+				ret = recvq->recvq_callbacks.callback_subcontext(&rcv_ev, dest_subcontext);
+				if (ret == IPS_RECVHDRQ_REVISIT)
+				{
+					PSM2_LOG_MSG("leaving");
+					/* When PSM_PERF is enabled, the following line causes the
+					PMU to stop a stop watch to measure instruction cycles of
+					the RX speedpath of PSM.  The stop watch was started
+					above. */
+					GENERIC_PERF_END(PSM_RX_SPEEDPATH_CTR);
+					return PSM2_OK_NO_PROGRESS;
+				}
+
+				goto skip_packet;
 			}
 
-			goto skip_packet;
-		}
+			if_pf(psmi_hal_rhf_get_all_err_flags(rcv_ev.psm_hal_rhf))
+			{
 
-		if_pf(psmi_hal_rhf_get_all_err_flags(rcv_ev.psm_hal_rhf)) {
+				_update_error_stats(recvq->proto, psmi_hal_rhf_get_all_err_flags(rcv_ev.psm_hal_rhf));
 
-			_update_error_stats(recvq->proto, psmi_hal_rhf_get_all_err_flags(rcv_ev.psm_hal_rhf));
+				recvq->recvq_callbacks.callback_error(&rcv_ev);
 
-			recvq->recvq_callbacks.callback_error(&rcv_ev);
+				if ((psmi_hal_rhf_get_rx_type(rcv_ev.psm_hal_rhf) != PSM_HAL_RHF_RX_TYPE_EAGER) ||
+					(!(psmi_hal_rhf_get_all_err_flags(rcv_ev.psm_hal_rhf) & PSMI_HAL_RHF_ERR_TID)))
+					goto skip_packet;
 
-			if ((psmi_hal_rhf_get_rx_type(rcv_ev.psm_hal_rhf) != PSM_HAL_RHF_RX_TYPE_EAGER) ||
-			    (!(psmi_hal_rhf_get_all_err_flags(rcv_ev.psm_hal_rhf) & PSMI_HAL_RHF_ERR_TID)))
-				goto skip_packet;
+				/* no pending eager update, header
+				* is not currently under tracing. */
+				if (state->hdr_countdown == 0 &&
+					state->rcv_egr_index_head == NO_EAGER_UPDATE)
+				{
+					uint32_t egr_cnt = psmi_hal_get_rx_egr_tid_cnt(recvq->context->psm_hw_ctxt);
+					psmi_hal_cl_idx etail = 0, ehead = 0;
 
-			/* no pending eager update, header
-			 * is not currently under tracing. */
-			if (state->hdr_countdown == 0 &&
-			    state->rcv_egr_index_head == NO_EAGER_UPDATE) {
-				uint32_t egr_cnt = psmi_hal_get_rx_egr_tid_cnt(recvq->context->psm_hw_ctxt);
-				psmi_hal_cl_idx etail=0, ehead=0;
+					ehead = psmi_hal_get_cl_q_head_index(
+						psm_hal_egr_q,
+						rcv_ev.recvq->context->psm_hw_ctxt);
+					etail = psmi_hal_get_cl_q_tail_index(
+						psm_hal_egr_q,
+						rcv_ev.recvq->context->psm_hw_ctxt);
+					if (ehead == ((etail + 1) % egr_cnt))
+					{
+						/* eager is full,
+						* trace existing header entries */
+						uint32_t hdr_size =
+							recvq->hdrq_elemlast +
+							hdrq_elemsz;
+						psmi_hal_cl_idx htail = 0;
 
-				ehead = psmi_hal_get_cl_q_head_index(
+						htail = psmi_hal_get_cl_q_tail_index(
+							psm_hal_hdr_q,
+							rcv_ev.recvq->context->psm_hw_ctxt);
+						const uint32_t hhead = state->hdrq_head;
+
+						state->hdr_countdown =
+							(htail > hhead) ? (htail - hhead) : (htail + hdr_size - hhead);
+					}
+				}
+
+				/* Eager packet and tiderr.
+				* Don't consider updating egr head, unless we're in
+				* the congested state.  If we're congested, we should
+				* try to keep the eager buffers free. */
+
+				if (!rcv_ev.is_congested)
+					goto skip_packet_no_egr_update;
+				else
+					goto skip_packet;
+			}
+
+			/* If checksum is enabled, verify that it is valid */
+			if_pf(rcv_ev.has_cksum && !do_pkt_cksum(&rcv_ev)) goto skip_packet;
+
+			if (_HFI_VDBG_ON)
+			{
+				psmi_hal_cl_idx egr_buff_q_head, egr_buff_q_tail;
+
+				egr_buff_q_head = psmi_hal_get_cl_q_head_index(
 					psm_hal_egr_q,
 					rcv_ev.recvq->context->psm_hw_ctxt);
-				etail = psmi_hal_get_cl_q_tail_index(
+				egr_buff_q_tail = psmi_hal_get_cl_q_tail_index(
 					psm_hal_egr_q,
 					rcv_ev.recvq->context->psm_hw_ctxt);
-				if (ehead == ((etail + 1) % egr_cnt)) {
-					/* eager is full,
-					 * trace existing header entries */
-					uint32_t hdr_size =
-						recvq->hdrq_elemlast +
-						hdrq_elemsz;
-					psmi_hal_cl_idx htail=0;
 
-					htail = psmi_hal_get_cl_q_tail_index(
-					   psm_hal_hdr_q,
-					   rcv_ev.recvq->context->psm_hw_ctxt);
-					const uint32_t hhead = state->hdrq_head;
+				_HFI_VDBG_ALWAYS(
+					"hdrq_head %d, p_hdr: %p, opcode %x, payload %p paylen %d; "
+					"egrhead %x egrtail %x; "
+					"useegrbit %x egrindex %x, egroffset %x, egrindexhead %x\n",
+					state->hdrq_head,
+					rcv_ev.p_hdr,
+					_get_proto_hfi_opcode(rcv_ev.p_hdr),
+					ips_recvhdrq_event_payload(&rcv_ev),
+					ips_recvhdrq_event_paylen(&rcv_ev),
+					egr_buff_q_head, egr_buff_q_tail,
+					psmi_hal_rhf_get_use_egr_buff(rcv_ev.psm_hal_rhf),
+					psmi_hal_rhf_get_egr_buff_index(rcv_ev.psm_hal_rhf),
+					psmi_hal_rhf_get_egr_buff_offset(rcv_ev.psm_hal_rhf),
+					state->rcv_egr_index_head);
+			}
 
-					state->hdr_countdown =
-						(htail > hhead) ?
-						(htail - hhead) :
-						(htail + hdr_size - hhead);
+			PSM2_LOG_PKT_STRM(PSM2_LOG_RX, rcv_ev.p_hdr, &rcv_ev.psm_hal_rhf.raw_rhf,
+							  "PKT_STRM:");
+
+			/* Classify packet from a known or unknown endpoint */
+			epstaddr = ips_epstate_lookup(recvq->epstate,
+										  rcv_ev.p_hdr->connidx);
+			if_pf((epstaddr == NULL) || (epstaddr->ipsaddr == NULL))
+			{
+				rcv_ev.ipsaddr = NULL;
+				recvq->recvq_callbacks.callback_packet_unknown(&rcv_ev);
+			}
+			else
+			{
+				rcv_ev.ipsaddr = epstaddr->ipsaddr;
+				ret = ips_proto_process_packet(&rcv_ev);
+				if (ret == IPS_RECVHDRQ_REVISIT)
+				{
+					PSM2_LOG_MSG("leaving");
+					/* When PSM_PERF is enabled, the following line causes the
+					PMU to stop a stop watch to measure instruction cycles of
+					the RX speedpath of PSM.  The stop watch was started
+					above. */
+					GENERIC_PERF_END(PSM_RX_SPEEDPATH_CTR);
+					return PSM2_OK_NO_PROGRESS;
 				}
 			}
 
-			/* Eager packet and tiderr.
-			 * Don't consider updating egr head, unless we're in
-			 * the congested state.  If we're congested, we should
-			 * try to keep the eager buffers free. */
-
-			if (!rcv_ev.is_congested)
-				goto skip_packet_no_egr_update;
-			else
-				goto skip_packet;
-		}
-
-		/* If checksum is enabled, verify that it is valid */
-		if_pf(rcv_ev.has_cksum && !do_pkt_cksum(&rcv_ev))
-			goto skip_packet;
-
-		if (_HFI_VDBG_ON)
-		{
-			psmi_hal_cl_idx egr_buff_q_head, egr_buff_q_tail;
-
-			egr_buff_q_head = psmi_hal_get_cl_q_head_index(
-					    psm_hal_egr_q,
-					    rcv_ev.recvq->context->psm_hw_ctxt);
-			egr_buff_q_tail = psmi_hal_get_cl_q_tail_index(
-					    psm_hal_egr_q,
-					    rcv_ev.recvq->context->psm_hw_ctxt);
-
-			_HFI_VDBG_ALWAYS(
-				"hdrq_head %d, p_hdr: %p, opcode %x, payload %p paylen %d; "
-				"egrhead %x egrtail %x; "
-				"useegrbit %x egrindex %x, egroffset %x, egrindexhead %x\n",
-				state->hdrq_head,
-				rcv_ev.p_hdr,
-				_get_proto_hfi_opcode(rcv_ev.p_hdr),
-				ips_recvhdrq_event_payload(&rcv_ev),
-				ips_recvhdrq_event_paylen(&rcv_ev),
-				egr_buff_q_head,egr_buff_q_tail,
-				psmi_hal_rhf_get_use_egr_buff(rcv_ev.psm_hal_rhf),
-				psmi_hal_rhf_get_egr_buff_index(rcv_ev.psm_hal_rhf),
-				psmi_hal_rhf_get_egr_buff_offset(rcv_ev.psm_hal_rhf),
-				state->rcv_egr_index_head);
-		}
-
-                PSM2_LOG_PKT_STRM(PSM2_LOG_RX,rcv_ev.p_hdr,&rcv_ev.psm_hal_rhf.raw_rhf,
-				  "PKT_STRM:");
-
-		/* Classify packet from a known or unknown endpoint */
-		epstaddr = ips_epstate_lookup(recvq->epstate,
-					       rcv_ev.p_hdr->connidx);
-		if_pf((epstaddr == NULL) || (epstaddr->ipsaddr == NULL)) {
-			rcv_ev.ipsaddr = NULL;
-			recvq->recvq_callbacks.
-			    callback_packet_unknown(&rcv_ev);
-		} else {
-			rcv_ev.ipsaddr = epstaddr->ipsaddr;
-			ret = ips_proto_process_packet(&rcv_ev);
-			if (ret == IPS_RECVHDRQ_REVISIT)
+		skip_packet:
+			/*
+			* if eager buffer is used, record the index.
+			*/
+			if (psmi_hal_rhf_get_use_egr_buff(rcv_ev.psm_hal_rhf))
 			{
-				PSM2_LOG_MSG("leaving");
-				/* When PSM_PERF is enabled, the following line causes the
-				   PMU to stop a stop watch to measure instruction cycles of
-				   the RX speedpath of PSM.  The stop watch was started
-				   above. */
-				GENERIC_PERF_END(PSM_RX_SPEEDPATH_CTR);
-				return PSM2_OK_NO_PROGRESS;
+				/* set only when a new entry is used */
+				if (psmi_hal_rhf_get_egr_buff_offset(rcv_ev.psm_hal_rhf) == 0)
+				{
+					state->rcv_egr_index_head =
+						psmi_hal_rhf_get_egr_buff_index(rcv_ev.psm_hal_rhf);
+					state->num_egrq_done++;
+				}
+				/* a header entry is using an eager entry, stop tracing. */
+				state->hdr_countdown = 0;
 			}
-		}
 
-skip_packet:
-		/*
-		 * if eager buffer is used, record the index.
-		 */
-		if (psmi_hal_rhf_get_use_egr_buff(rcv_ev.psm_hal_rhf)) {
-			/* set only when a new entry is used */
-			if (psmi_hal_rhf_get_egr_buff_offset(rcv_ev.psm_hal_rhf) == 0) {
-				state->rcv_egr_index_head =
-					psmi_hal_rhf_get_egr_buff_index(rcv_ev.psm_hal_rhf);
-				state->num_egrq_done++;
-			}
-			/* a header entry is using an eager entry, stop tracing. */
-			state->hdr_countdown = 0;
-		}
+		skip_packet_no_egr_update:
+			/* Note that state->hdrq_head is sampled speculatively by the code
+			* in ips_ptl_shared_poll() when context sharing, so it is not safe
+			* for this shared variable to temporarily exceed the last element. */
+			_HFI_VDBG("head %d, elemsz %d elemlast %d\n",
+					  state->hdrq_head, hdrq_elemsz,
+					  recvq->hdrq_elemlast);
+			psmi_hal_retire_hdr_q_entry(&state->hdrq_head, psm_hal_hdr_q,
+										recvq->context->psm_hw_ctxt,
+										hdrq_elemsz, recvq->hdrq_elemlast, &empty);
+			state->num_hdrq_done++;
+			num_hdrq_done++;
+			done = (!next_hdrq_is_ready() || (ret == IPS_RECVHDRQ_BREAK) || (num_hdrq_done == num_hdrq_todo));
 
-skip_packet_no_egr_update:
-		/* Note that state->hdrq_head is sampled speculatively by the code
-		 * in ips_ptl_shared_poll() when context sharing, so it is not safe
-		 * for this shared variable to temporarily exceed the last element. */
-		_HFI_VDBG
-		    ("head %d, elemsz %d elemlast %d\n",
-		     state->hdrq_head, hdrq_elemsz,
-		     recvq->hdrq_elemlast);
-		psmi_hal_retire_hdr_q_entry(&state->hdrq_head, psm_hal_hdr_q,
-					    recvq->context->psm_hw_ctxt,
-					    hdrq_elemsz, recvq->hdrq_elemlast, &empty);
-		state->num_hdrq_done++;
-		num_hdrq_done++;
-		done = (!next_hdrq_is_ready() || (ret == IPS_RECVHDRQ_BREAK)
-			|| (num_hdrq_done == num_hdrq_todo));
+			do_hdr_update = (state->head_update_interval ? (state->num_hdrq_done ==
+															state->head_update_interval)
+														 : done);
+			if (do_hdr_update)
+			{
 
-		do_hdr_update = (state->head_update_interval ?
-				 (state->num_hdrq_done ==
-				  state->head_update_interval) : done);
-		if (do_hdr_update) {
-
-			psmi_hal_set_cl_q_head_index(
+				psmi_hal_set_cl_q_head_index(
 					state->hdrq_head,
 					psm_hal_hdr_q,
-				 	rcv_ev.recvq->context->psm_hw_ctxt);
-			/* Reset header queue entries processed */
-			state->num_hdrq_done = 0;
-		}
-		if (state->num_egrq_done >= state->egrq_update_interval) {
-			/* Lazy update of egrq */
-			if (state->rcv_egr_index_head != NO_EAGER_UPDATE) {
-				psmi_hal_set_cl_q_head_index(
-					state->rcv_egr_index_head,
-				     	psm_hal_egr_q,
-				        recvq->context->psm_hw_ctxt);
-				state->rcv_egr_index_head = NO_EAGER_UPDATE;
-				state->num_egrq_done = 0;
+					rcv_ev.recvq->context->psm_hw_ctxt);
+				/* Reset header queue entries processed */
+				state->num_hdrq_done = 0;
 			}
-		}
-		if (state->hdr_countdown > 0) {
-			/* a header entry is consumed. */
-			state->hdr_countdown -= hdrq_elemsz;
-			if (state->hdr_countdown == 0) {
-				/* header entry count reaches zero. */
-				psmi_hal_cl_idx tail=0;
+			if (state->num_egrq_done >= state->egrq_update_interval)
+			{
+				/* Lazy update of egrq */
+				if (state->rcv_egr_index_head != NO_EAGER_UPDATE)
+				{
+					psmi_hal_set_cl_q_head_index(
+						state->rcv_egr_index_head,
+						psm_hal_egr_q,
+						recvq->context->psm_hw_ctxt);
+					state->rcv_egr_index_head = NO_EAGER_UPDATE;
+					state->num_egrq_done = 0;
+				}
+			}
+			if (state->hdr_countdown > 0)
+			{
+				/* a header entry is consumed. */
+				state->hdr_countdown -= hdrq_elemsz;
+				if (state->hdr_countdown == 0)
+				{
+					/* header entry count reaches zero. */
+					psmi_hal_cl_idx tail = 0;
 
-				tail = psmi_hal_get_cl_q_tail_index(
-					   psm_hal_egr_q,
-					   recvq->context->psm_hw_ctxt);
-
-				psmi_hal_cl_idx head=0;
-
-				head = psmi_hal_get_cl_q_head_index(
-					   psm_hal_egr_q,
-					   recvq->context->psm_hw_ctxt);
-
-				uint32_t egr_cnt = psmi_hal_get_rx_egr_tid_cnt(recvq->context->psm_hw_ctxt);
-				/* Checks eager-full again. This is a real false-egr-full */
-				if (head == ((tail + 1) % egr_cnt)) {
-
-					psmi_hal_set_cl_q_tail_index(
-						tail,
-					        psm_hal_egr_q,
+					tail = psmi_hal_get_cl_q_tail_index(
+						psm_hal_egr_q,
 						recvq->context->psm_hw_ctxt);
 
-					_HFI_DBG
-					    ("eager array full after overflow, flushing "
-					     "(head %llx, tail %llx)\n",
-					     (long long)head, (long long)tail);
-					recvq->proto->stats.egr_overflow++;
-				} else
-					_HFI_ERROR
-					    ("PSM BUG: EgrOverflow: eager queue is not full\n");
+					psmi_hal_cl_idx head = 0;
+
+					head = psmi_hal_get_cl_q_head_index(
+						psm_hal_egr_q,
+						recvq->context->psm_hw_ctxt);
+
+					uint32_t egr_cnt = psmi_hal_get_rx_egr_tid_cnt(recvq->context->psm_hw_ctxt);
+					/* Checks eager-full again. This is a real false-egr-full */
+					if (head == ((tail + 1) % egr_cnt))
+					{
+
+						psmi_hal_set_cl_q_tail_index(
+							tail,
+							psm_hal_egr_q,
+							recvq->context->psm_hw_ctxt);
+
+						_HFI_DBG("eager array full after overflow, flushing "
+								 "(head %llx, tail %llx)\n",
+								 (long long)head, (long long)tail);
+						recvq->proto->stats.egr_overflow++;
+					}
+					else
+						_HFI_ERROR("PSM BUG: EgrOverflow: eager queue is not full\n");
+				}
 			}
 		}
+		/* while (hdrq_entries_to_read) */
+
+		/* Process any pending acks before exiting */
+		process_pending_acks(recvq);
+
+		PSM2_LOG_MSG("leaving");
+		/* When PSM_PERF is enabled, the following line causes the
+		PMU to stop a stop watch to measure instruction cycles of
+		the RX speedpath of PSM.  The stop watch was started
+		above. */
+		GENERIC_PERF_END(PSM_RX_SPEEDPATH_CTR);
 	}
-	/* while (hdrq_entries_to_read) */
 
-	/* Process any pending acks before exiting */
-	process_pending_acks(recvq);
-
-	PSM2_LOG_MSG("leaving");
-	/* When PSM_PERF is enabled, the following line causes the
-	   PMU to stop a stop watch to measure instruction cycles of
-	   the RX speedpath of PSM.  The stop watch was started
-	   above. */
-	GENERIC_PERF_END(PSM_RX_SPEEDPATH_CTR);
 	return num_hdrq_done ? PSM2_OK : PSM2_OK_NO_PROGRESS;
 }
 
