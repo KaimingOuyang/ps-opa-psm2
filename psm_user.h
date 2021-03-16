@@ -107,6 +107,25 @@ typedef void *psmi_hal_hw_context;
 #define PSMI_VERNO_GET_MAJOR(verno) (((verno)>>8) & 0xff)
 #define PSMI_VERNO_GET_MINOR(verno) (((verno)>>0) & 0xff)
 
+extern int psm2_owner_pid;
+extern int psm2_rvthd_pid;
+#define PSM2_IS_STEALER(idx) ((idx) != psm2_owner_pid && (idx) != psm2_rvthd_pid)
+
+struct psm2_flow_task {
+	struct ips_flow *flow;
+	struct psm2_flow_task *next;
+};
+
+struct psm2_flow_task_queue {
+	struct psm2_flow_task *head, *tail;
+	psmi_lock_t qlock;
+};
+
+extern struct psm2_flow_task_queue psm2_ftq;
+
+void psm2_flow_task_enqueue(struct psm2_flow_task_queue *ftq, struct psm2_flow_task *task);
+struct psm2_flow_task* psm2_flow_task_dequeue(struct psm2_flow_task_queue *ftq);
+
 int psmi_verno_client();
 int psmi_verno_isinteroperable(uint16_t verno);
 int MOCKABLE(psmi_isinitialized)();

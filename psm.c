@@ -380,6 +380,37 @@ fail:
 }
 #endif
 
+/* interprocess progress stealing related data */
+int psm2_owner_pid;
+int psm2_rvthd_pid;
+struct psm2_flow_task_queue psm2_ftq;
+
+void psm2_flow_task_enqueue(struct psm2_flow_task_queue *ftq, struct psm2_flow_task *task){
+	PSMI_LOCK(ftq->qlock);
+	task->next = NULL;
+	if(ftq->head == NULL) {
+		ftq->head = ftq->tail = task;
+	} else {
+		ftq->tail->next = task;
+		ftq->tail = task;
+	}
+	PSMI_UNLOCK(ftq->qlock);
+}
+
+struct psm2_flow_task* psm2_flow_task_dequeue(struct psm2_flow_task_queue *ftq){
+	if(ftq->head == NULL)
+		return NULL;
+
+	struct psm2_flow_task *task;
+	PSMI_LOCK(ftq->qlock);
+	task = ftq->head;
+	if(task)
+		ftq->head = task->next;
+	PSMI_UNLOCK(ftq->qlock);
+
+	return task;
+}
+
 psm2_error_t __psm2_init(int *major, int *minor)
 {
 	psm2_error_t err = PSM2_OK;
@@ -388,6 +419,11 @@ psm2_error_t __psm2_init(int *major, int *minor)
 	psmi_log_initialize();
 
 	PSM2_LOG_MSG("entering");
+
+	/* get owner pid */
+	psm2_owner_pid = getpid();
+	psm2_ftq.head = psm2_ftq.tail = NULL;
+	psmi_init_lock(&psm2_ftq.qlock);
 
 	/* When PSM_PERF is enabled, the following code causes the
 	   PMU to be programmed to measure instruction cycles of the
@@ -1120,32 +1156,46 @@ PSMI_API_DECL(psm2_poll)
 psm2_error_t __psmi_poll_internal(psm2_ep_t ep, int poll_amsh)
 {
 	psm2_error_t err1 = PSM2_OK_NO_PROGRESS;
-	psm2_error_t err2;
+	psm2_error_t err2 = PSM2_OK_NO_PROGRESS;
+	psm2_error_t err3 = PSM2_OK_NO_PROGRESS;
 	psm2_ep_t tmp;
-
+	int cur_pid = getpid(); 
+	
 	PSM2_LOG_MSG("entering");
-	PSMI_LOCK_ASSERT(ep->mq->progress_lock);
 
-	tmp = ep;
-	do {
-		if (poll_amsh) {
-			err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0);	/* poll reqs & reps */
-			if (err1 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
-				PSM2_LOG_MSG("leaving");
-				return err1;
+	if(!PSM2_IS_STEALER(cur_pid)) {
+		PSMI_LOCK_ASSERT(ep->mq->progress_lock);
+
+		/* check whether any flow needs to be flushed */
+		struct psm2_flow_task *task;
+		while((task = psm2_flow_task_dequeue(&psm2_ftq))) {
+			task->flow->flush(task->flow, NULL);
+			free(task);
+			err3 = PSM2_OK;
+		}
+		
+		tmp = ep;
+		do {
+			if (poll_amsh) {
+				err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0);	/* poll reqs & reps */
+				if (err1 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
+					PSM2_LOG_MSG("leaving");
+					return err1;
+				}
 			}
-		}
 
-		err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0);	/* get into ips_do_work */
-		if (err2 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
-			PSM2_LOG_MSG("leaving");
-			return err2;
-		}
+			err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0);	/* get into ips_do_work */
+			if (err2 > PSM2_OK_NO_PROGRESS) { /* some error unrelated to polling */
+				PSM2_LOG_MSG("leaving");
+				return err2;
+			}
 
-		ep = ep->mctxt_next;
-	} while (ep != tmp);
+			ep = ep->mctxt_next;
+		} while (ep != tmp);
+	}
+	
 	PSM2_LOG_MSG("leaving");
-	return (err1 & err2);
+	return (err1 & err2 & err3);
 }
 PSMI_API_DECL(psmi_poll_internal)
 #ifdef PSM_PROFILE
