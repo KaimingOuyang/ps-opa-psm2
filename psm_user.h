@@ -108,8 +108,7 @@ typedef void *psmi_hal_hw_context;
 #define PSMI_VERNO_GET_MINOR(verno) (((verno)>>0) & 0xff)
 
 extern int psm2_owner_pid;
-extern int psm2_rvthd_pid;
-#define PSM2_IS_STEALER(idx) ((idx) != psm2_owner_pid && (idx) != psm2_rvthd_pid)
+#define PSM2_IS_STEALER(idx) ((idx) != psm2_owner_pid)
 
 struct psm2_flow_task {
 	struct ips_flow *flow;

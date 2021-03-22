@@ -382,7 +382,6 @@ fail:
 
 /* interprocess progress stealing related data */
 int psm2_owner_pid;
-int psm2_rvthd_pid;
 struct psm2_flow_task_queue psm2_ftq;
 
 void psm2_flow_task_enqueue(struct psm2_flow_task_queue *ftq, struct psm2_flow_task *task){

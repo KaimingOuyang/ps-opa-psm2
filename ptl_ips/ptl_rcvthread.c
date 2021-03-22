@@ -356,9 +356,6 @@ void *ips_ptl_pollintr(void *rcvthreadc)
 	 * recvhdrq init function is misused */
 	psmi_assert_always(psmi_hal_has_sw_status(PSM_HAL_PSMI_RUNTIME_RX_THREAD_STARTED));
 
-	/* get recv background thread pid, in pip env, thread pid is different from parent pid */
-	psm2_rvthd_pid = getpid();
-
 	/* Switch driver to a mode where it can interrupt on urgent packets */
 	if (psmi_context_interrupt_set((psmi_context_t *)
 				       rcvc->context, 1) == PSM2_EP_NO_RESOURCES) {
