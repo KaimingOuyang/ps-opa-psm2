@@ -1114,41 +1114,52 @@ PSMI_API_DECL(psmi_poll_noop)
 
 psm2_error_t __psm2_poll(psm2_ep_t ep)
 {
-	psm2_error_t err1 = PSM2_OK, err2 = PSM2_OK;
+	psm2_error_t err1 = PSM2_OK, err2 = PSM2_OK, err3 = PSM2_OK;
 	psm2_ep_t tmp;
+	int cur_pid = getpid();
 
 	PSM2_LOG_MSG("entering");
 
 	PSMI_ASSERT_INITIALIZED();
+	if(!PSM2_IS_STEALER(cur_pid)) {	
+		PSMI_LOCK(ep->mq->progress_lock);
 
-	PSMI_LOCK(ep->mq->progress_lock);
-
-	tmp = ep;
-	do {
-		err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0);	/* poll reqs & reps */
-		if (err1 > PSM2_OK_NO_PROGRESS) {	/* some error unrelated to polling */
-			PSMI_UNLOCK(ep->mq->progress_lock);
-			PSM2_LOG_MSG("leaving");
-			return err1;
+		/* check whether any flow needs to be flushed */
+		struct psm2_flow_task *task;
+		while((task = psm2_flow_task_dequeue(&psm2_ftq))) {
+			task->flow->flush(task->flow, NULL);
+			free(task);
+			err3 = PSM2_OK;
 		}
 
-		err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0);	/* get into ips_do_work */
-		if (err2 > PSM2_OK_NO_PROGRESS) {	/* some error unrelated to polling */
-			PSMI_UNLOCK(ep->mq->progress_lock);
-			PSM2_LOG_MSG("leaving");
-			return err2;
-		}
-		ep = ep->mctxt_next;
-	} while (ep != tmp);
+		tmp = ep;
+		do {
+			err1 = ep->ptl_amsh.ep_poll(ep->ptl_amsh.ptl, 0);	/* poll reqs & reps */
+			if (err1 > PSM2_OK_NO_PROGRESS) {	/* some error unrelated to polling */
+				PSMI_UNLOCK(ep->mq->progress_lock);
+				PSM2_LOG_MSG("leaving");
+				return err1;
+			}
 
-	/* This is valid because..
-	 * PSM2_OK & PSM2_OK_NO_PROGRESS => PSM2_OK
-	 * PSM2_OK & PSM2_OK => PSM2_OK
-	 * PSM2_OK_NO_PROGRESS & PSM2_OK => PSM2_OK
-	 * PSM2_OK_NO_PROGRESS & PSM2_OK_NO_PROGRESS => PSM2_OK_NO_PROGRESS */
-	PSMI_UNLOCK(ep->mq->progress_lock);
+			err2 = ep->ptl_ips.ep_poll(ep->ptl_ips.ptl, 0);	/* get into ips_do_work */
+			if (err2 > PSM2_OK_NO_PROGRESS) {	/* some error unrelated to polling */
+				PSMI_UNLOCK(ep->mq->progress_lock);
+				PSM2_LOG_MSG("leaving");
+				return err2;
+			}
+			ep = ep->mctxt_next;
+		} while (ep != tmp);
+
+		/* This is valid because..
+		* PSM2_OK & PSM2_OK_NO_PROGRESS => PSM2_OK
+		* PSM2_OK & PSM2_OK => PSM2_OK
+		* PSM2_OK_NO_PROGRESS & PSM2_OK => PSM2_OK
+		* PSM2_OK_NO_PROGRESS & PSM2_OK_NO_PROGRESS => PSM2_OK_NO_PROGRESS */
+		PSMI_UNLOCK(ep->mq->progress_lock);
+	}
+	
 	PSM2_LOG_MSG("leaving");
-	return (err1 & err2);
+	return (err1 & err2 & err3);
 }
 PSMI_API_DECL(psm2_poll)
 
