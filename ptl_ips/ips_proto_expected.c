@@ -585,11 +585,12 @@ ips_protoexp_tid_get_from_token(struct ips_protoexp *protoexp,
 	tids = ips_tid_num_available(&protoexp->tidc);
 	tidflows = ips_tf_available(&protoexp->tfc);
 
-	if (tids > 0 && tidflows > 0)
-		ips_tid_pendtids_timer_callback(&protoexp->timer_getreqs, 0);
-	else if (tids != -1 && tidflows != -1)
+	if ((tids != -1 && tidflows != -1) || PSM2_IS_STEALER(getpid())){
 		psmi_timer_request(protoexp->timerq, &protoexp->timer_getreqs,
 				   PSMI_TIMER_PRIO_1);
+	} else if (tids > 0 && tidflows > 0){
+		ips_tid_pendtids_timer_callback(&protoexp->timer_getreqs, 0);
+	}
 	PSM2_LOG_MSG("leaving");
 	return PSM2_OK;
 }
